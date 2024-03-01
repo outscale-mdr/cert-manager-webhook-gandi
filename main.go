@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -14,8 +17,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
-	"os"
-	"strings"
 )
 
 const (
@@ -66,6 +67,7 @@ type gandiDNSProviderConfig struct {
 	// These fields will be set by users in the
 	// `issuer.spec.acme.dns01.providers.webhook.config` field.
 	APIKeySecretRef cmmeta.SecretKeySelector `json:"apiKeySecretRef"`
+	PatSecretRef    cmmeta.SecretKeySelector `json:"patSecretRef"`
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -101,16 +103,13 @@ func (c *gandiDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 
 	klog.V(6).Infof("decoded configuration %v", cfg)
 
-	apiKey, err := c.getApiKey(&cfg, ch.ResourceNamespace)
+	clientcfg, err := c.initClientConfigCredentials(&cfg, ch.ResourceNamespace)
 	if err != nil {
-		return fmt.Errorf("unable to get API key: %v", err)
+		return fmt.Errorf("unable to configure the client config with credentials: %v", err)
 	}
+	clientcfg.Debug = false
+	clientcfg.DryRun = false
 
-	clientcfg := &config.Config{
-		APIKey: *apiKey,
-		Debug:  false,
-		DryRun: false,
-	}
 	gandiClient := gandi.NewLiveDNSClient(*clientcfg)
 
 	entry, domain := c.getDomainAndEntry(ch)
@@ -157,16 +156,13 @@ func (c *gandiDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 
 	klog.V(6).Infof("decoded configuration %v", cfg)
 
-	apiKey, err := c.getApiKey(&cfg, ch.ResourceNamespace)
+	clientcfg, err := c.initClientConfigCredentials(&cfg, ch.ResourceNamespace)
 	if err != nil {
-		return fmt.Errorf("unable to get API key: %v", err)
+		return fmt.Errorf("unable to configure the client config with credentials: %v", err)
 	}
+	clientcfg.Debug = false
+	clientcfg.DryRun = false
 
-	clientcfg := &config.Config{
-		APIKey: *apiKey,
-		Debug:  true,
-		DryRun: false,
-	}
 	gandiClient := gandi.NewLiveDNSClient(*clientcfg)
 
 	entry, domain := c.getDomainAndEntry(ch)
@@ -232,22 +228,41 @@ func (c *gandiDNSProviderSolver) getDomainAndEntry(ch *v1alpha1.ChallengeRequest
 }
 
 // Get Gandi API key from Kubernetes secret.
-func (c *gandiDNSProviderSolver) getApiKey(cfg *gandiDNSProviderConfig, namespace string) (*string, error) {
-	secretName := cfg.APIKeySecretRef.LocalObjectReference.Name
+func (c *gandiDNSProviderSolver) getSecret(keySelector *cmmeta.SecretKeySelector, namespace string) (*string, error) {
+	secretName := keySelector.LocalObjectReference.Name
 
-	klog.V(6).Infof("try to load secret `%s` with key `%s`", secretName, cfg.APIKeySecretRef.Key)
+	klog.V(6).Infof("try to load secret `%s` with key `%s`", secretName, keySelector.Key)
 
 	sec, err := c.client.CoreV1().Secrets(namespace).Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("unable to get secret `%s`; %v", secretName, err)
 	}
 
-	secBytes, ok := sec.Data[cfg.APIKeySecretRef.Key]
+	secBytes, ok := sec.Data[keySelector.Key]
 	if !ok {
-		return nil, fmt.Errorf("key %q not found in secret \"%s/%s\"", cfg.APIKeySecretRef.Key,
-			cfg.APIKeySecretRef.LocalObjectReference.Name, namespace)
+		return nil, fmt.Errorf("key %q not found in secret \"%s/%s\"", keySelector.Key,
+			keySelector.LocalObjectReference.Name, namespace)
 	}
 
 	apiKey := string(secBytes)
 	return &apiKey, nil
+}
+
+// Init Client configuration
+func (c *gandiDNSProviderSolver) initClientConfigCredentials(cfg *gandiDNSProviderConfig, namespace string) (*config.Config, error) {
+	clientcfg := &config.Config{}
+	//
+	apiKey, err := c.getSecret(&cfg.APIKeySecretRef, namespace)
+	if err != nil {
+		klog.V(6).Infof("unable to get api key: %v... Trying PAT", err)
+		pat, err := c.getSecret(&cfg.PatSecretRef, namespace)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get pat: %v", err)
+		}
+		clientcfg.PersonalAccessToken = *pat
+	} else {
+		clientcfg.APIKey = *apiKey
+	}
+
+	return clientcfg, nil
 }
