@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: sintef/cert-manager-webhook-gandi
+  IMAGE_NAME: outscale-mdr/cert-manager-webhook-gandi
 
 jobs:
   build-and-push-image:
